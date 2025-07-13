@@ -7,4 +7,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["python", "pinecone_setup.py"]
+CMD ["gunicorn", "--bind", "0.0.0.0:$PORT", "--timeout", "600", "pinecone_setup:app"]

@@ -2,10 +2,11 @@ import os
 from pinecone import Pinecone, ServerlessSpec
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
+from flask import Flask, jsonify, request
 import sys
 
-# Load environment variables
-load_dotenv()
+# Initialize Flask app
+app = Flask(__name__)
 
 # Configuration
 CONFIG = {
@@ -16,34 +17,38 @@ CONFIG = {
     "embedding_model": "all-MiniLM-L6-v2"
 }
 
+# Global variables for initialized components
+pc = None
+model = None
+index = None
+
 def initialize_components():
-    """Initialize Pinecone and embedding model with error handling"""
+    """Initialize Pinecone and embedding model"""
+    global pc, model
     try:
-        # Validate API key
+        load_dotenv()
         api_key = os.getenv("PINECONE_API_KEY")
         if not api_key:
-            raise ValueError("PINECONE_API_KEY not found in .env file")
+            raise ValueError("PINECONE_API_KEY not found in environment")
         
         pc = Pinecone(api_key=api_key)
         model = SentenceTransformer(CONFIG["embedding_model"])
         return pc, model
         
     except Exception as e:
-        print(f"Initialization failed: {str(e)}")
+        app.logger.error(f"Initialization failed: {str(e)}")
         sys.exit(1)
 
-def setup_index(pc):
-    """Create or connect to Pinecone index with proper dimension"""
+def setup_index():
+    """Create or connect to Pinecone index"""
+    global index
     try:
-        # Check if index exists and has correct dimension
         if CONFIG["index_name"] in pc.list_indexes().names():
             index_info = pc.describe_index(CONFIG["index_name"])
             if index_info.dimension != CONFIG["dimension"]:
-                print(f"Existing index has wrong dimension ({index_info.dimension}), deleting...")
                 pc.delete_index(CONFIG["index_name"])
-                print("Deleted old index with incorrect dimension")
+                app.logger.info("Deleted old index with incorrect dimension")
                 
-        # Create new index if needed
         if CONFIG["index_name"] not in pc.list_indexes().names():
             pc.create_index(
                 name=CONFIG["index_name"],
@@ -51,95 +56,86 @@ def setup_index(pc):
                 metric=CONFIG["metric"],
                 spec=CONFIG["spec"]
             )
-            print(f"Created index: {CONFIG['index_name']} with dimension {CONFIG['dimension']}")
-        else:
-            print(f"Using existing index: {CONFIG['index_name']}")
+            app.logger.info(f"Created new index: {CONFIG['index_name']}")
             
-        return pc.Index(CONFIG["index_name"])
+        index = pc.Index(CONFIG["index_name"])
+        return index
         
     except Exception as e:
-        print(f"Index setup failed: {str(e)}")
+        app.logger.error(f"Index setup failed: {str(e)}")
         sys.exit(1)
 
-def upsert_documents(index, model):
-    """Insert sample documents with embeddings"""
-    documents = [
-        {
-            "id": "doc1",
-            "text": "Einstein's theory of relativity revolutionized modern physics",
-            "category": "science"
-        },
-        {
-            "id": "doc2", 
-            "text": "Ancient Roman aqueducts were engineering marvels",
-            "category": "history"
-        },
-        {
-        "id": "doc3",
-        "text": "Quantum mechanics describes subatomic particles",
-        "category": "physics"
-        },
-       {
-        "id": "doc4",
-        "text": "The Colosseum was an ancient Roman amphitheater",
-        "category": "history"
-       }
-    ]
-    
+@app.route('/')
+def health_check():
+    return jsonify({
+        "status": "healthy",
+        "index": CONFIG["index_name"],
+        "model": CONFIG["embedding_model"]
+    })
+
+@app.route('/upsert', methods=['POST'])
+def upsert_documents():
+    """Insert documents with embeddings"""
     try:
+        documents = request.json
         vectors = [
             (
                 doc["id"],
                 model.encode(doc["text"]).tolist(),
-                {"text": doc["text"], "category": doc["category"]}
+                {"text": doc["text"], "category": doc.get("category", "")}
             ) for doc in documents
         ]
         
         index.upsert(vectors=vectors)
-        print(f"Inserted {len(documents)} documents")
-        return vectors
+        return jsonify({
+            "status": "success",
+            "inserted": len(vectors)
+        })
         
     except Exception as e:
-        print(f"Document upload failed: {str(e)}")
-        sys.exit(1)
+        return jsonify({"error": str(e)}), 500
 
-def query_index(index, model, query_text, top_k=1):
-    """Query the index and display results"""
+@app.route('/query', methods=['POST'])
+def query():
+    """Query the index"""
     try:
+        data = request.json
         results = index.query(
-            vector=model.encode(query_text).tolist(),
-            top_k=top_k,
+            vector=model.encode(data["query"]).tolist(),
+            top_k=data.get("top_k", 1),
             include_metadata=True
         )
         
-        print(f"\nTop {top_k} result(s) for '{query_text}':")
-        if not results.matches:
-            print("No matches found")
-        else:
-            for i, match in enumerate(results.matches, 1):
-                print(f"\nMatch {i}:")
-                print(f"ID: {match.id}")
-                print(f"Score: {match.score:.4f}")
-                print(f"Category: {match.metadata['category']}")
-                print(f"Content: {match.metadata['text']}")
-                
+        return jsonify({
+            "results": [
+                {
+                    "id": match.id,
+                    "score": float(match.score),
+                    "text": match.metadata["text"],
+                    "category": match.metadata.get("category", "")
+                } for match in results.matches
+            ]
+        })
+        
     except Exception as e:
-        print(f"Query failed: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
-def main():
-    """Main execution flow"""
-    # Initialize
-    pc, model = initialize_components()
+def initialize_app():
+    """Initialize all components"""
+    initialize_components()
+    setup_index()
     
-    # Setup index (now handles dimension mismatch)
-    index = setup_index(pc)
-    
-    # Insert data
-    upsert_documents(index, model)
-    
-    # Query examples
-    query_index(index, model, "scientific theories")
-    query_index(index, model, "ancient engineering", top_k=2)
+    # Sample data (optional)
+    sample_docs = [
+        {"id": "doc1", "text": "Einstein's theory of relativity", "category": "science"},
+        {"id": "doc2", "text": "Roman aqueducts were engineering marvels", "category": "history"}
+    ]
+    index.upsert(vectors=[
+        (doc["id"], model.encode(doc["text"]).tolist(), {"text": doc["text"], "category": doc["category"]})
+        for doc in sample_docs
+    ])
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    initialize_app()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
